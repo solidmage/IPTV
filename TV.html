@@ -1,0 +1,193 @@
+<!-- Lisää tämä DIV siihen kohtaan, mihin IPTV-widgetin haluat -->
+<div id="iptv-embed"></div>
+
+<script>
+/* IPTV-widget (Shadow DOM, ei vaikuta muuhun sivuun) */
+(function(){
+  const HOST_ID = 'iptv-embed';
+  const API = 'https://iptv-org.github.io/api';
+  const host = document.getElementById(HOST_ID);
+  if (!host) return;
+
+  const root = host.attachShadow({ mode:'open' });
+  root.innerHTML = `
+    <style>
+      /* Tyylit koskevat vain tätä widgettiä */
+      .card { border:1px solid #ddd; border-radius:12px; padding:12px; background:#fff; box-shadow:0 2px 8px rgba(0,0,0,.04); color:#000; }
+      .controls { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:8px; }
+      @media (max-width:780px){ .controls{ grid-template-columns:1fr; } }
+      label { display:flex; align-items:center; gap:6px; }
+      select, input[type="search"]{ width:100%; padding:8px 10px; border:1px solid #ccc; border-radius:8px; background:#fff; color:#000; }
+      .grid { display:grid; grid-template-columns:320px 1fr; gap:12px; }
+      @media (max-width:980px){ .grid{ grid-template-columns:1fr; } }
+      .list { max-height:60vh; overflow:auto; border:1px solid #eee; border-radius:8px; background:#fff; }
+      .row { width:100%; display:flex; align-items:center; gap:10px; padding:10px 12px; border-bottom:1px solid #f1f1f1; background:#fff; cursor:pointer; }
+      .row:hover { background:#f7f9fc; }
+      .logo { width:28px; height:28px; object-fit:contain; background:#f2f2f2; border:1px solid #eee; border-radius:4px; }
+      .name { font-weight:600; font-size:14px; color:#000; }
+      .meta { margin-left:auto; opacity:.75; font-size:12px; color:#000; }
+      video { width:100%; height:auto; background:#000; border-radius:8px; }
+      .status, .note { font-size:12px; opacity:.85; margin-top:6px; color:#000; }
+    </style>
+
+    <div class="card">
+      <div class="controls">
+        <label>Genre
+          <select id="genre"><option value="">Kaikki genret</option></select>
+        </label>
+        <label>Maa
+          <select id="country"><option value="">Kaikki maat</option></select>
+        </label>
+      </div>
+      <input id="q" type="search" placeholder="Hae kanavaa…" />
+      <div class="grid">
+        <div class="list" id="list"></div>
+        <div class="player">
+          <video id="v" controls autoplay playsinline muted></video>
+          <div id="status" class="status"></div>
+          <div class="note">Vihje: selaimet sallivat automaattisen toiston usein vain mykistettynä.</div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // ---- Apurit & muuttujat ----
+  const $ = s => root.querySelector(s);
+  const $v = $('#v'), $status = $('#status'), $list = $('#list'), $genre = $('#genre'), $country = $('#country'), $q = $('#q');
+
+  // Kategoriat suomeksi (iptv-org categories.json id:t → FI)
+  const FI_CAT = {
+    news:'Uutiset', entertainment:'Viihde', movies:'Elokuvat', series:'Sarjat',
+    sports:'Urheilu', music:'Musiikki', documentary:'Dokumentit', general:'Yleiset',
+    kids:'Lapset', family:'Perhe', comedy:'Komedia', education:'Koulutus', culture:'Kulttuuri',
+    lifestyle:'Lifestyle', shop:'Ostoskanavat', travel:'Matkailu', weather:'Sää',
+    business:'Talous', legislative:'Parlamentti', local:'Paikalliset', classic:'Klassikot',
+    animation:'Animaatio', cooking:'Ruoka', outdoor:'Ulkoilu', auto:'Autoilu',
+    science:'Tiede', technology:'Teknologia'
+  };
+
+  let hls = null, allItems = [], current = [];
+
+  function setStatus(t){ $status.textContent = t || ''; }
+  function destroyHls(){ if (hls){ try{ hls.destroy(); }catch{} hls=null; } $v.removeAttribute('src'); $v.load(); }
+  function regionName(code){ try{ return new Intl.DisplayNames(['fi'],{type:'region'}).of(code) || code; }catch{ return code; } }
+
+  // hyväksy vain HTTPS‑HLS ilman erikoisotsikoita → toimii frontista
+  function isPlayableStream(s){
+    if (!s || !s.url || !s.channel) return false;
+    const u = s.url.trim().toLowerCase();
+    return u.startsWith('https://') && u.includes('.m3u8') && !s.referrer && !s.user_agent;
+  }
+  function firstPlayableByChannel(streams){
+    const map = new Map();
+    for (const s of streams) if (isPlayableStream(s) && !map.has(s.channel)) map.set(s.channel, s.url);
+    return map;
+  }
+
+  async function probeStream(url){
+    if (location.protocol==='https:' && url.startsWith('http://')) return { ok:false, reason:'Sekasisältö (http‑virta https‑sivulla)' };
+    try{
+      const r = await fetch(url, { mode:'cors' });
+      if (!r.ok) return { ok:false, reason:`HTTP ${r.status}` };
+      const txt = await r.text();
+      if (!txt.startsWith('#EXTM3U')) return { ok:false, reason:'Ei HLS‑manifesti (#EXTM3U puuttuu)' };
+      if (location.protocol==='https:' && /^(?!#).*http:\/\//mi.test(txt)) return { ok:false, reason:'Manifesti sisältää http‑segmenttejä' };
+      return { ok:true };
+    }catch{ return { ok:false, reason:'CORS/anti‑hotlink estää pyynnön' }; }
+  }
+
+  async function play(url, label){
+    setStatus('Yhdistetään: ' + (label||''));
+    destroyHls();
+    const p = await probeStream(url);
+    if (!p.ok){ setStatus('Toisto estyi: ' + p.reason + '.'); return; }
+
+    if ($v.canPlayType('application/vnd.apple.mpegurl')){ $v.src=url; $v.play().catch(()=>{}); setStatus(''); return; }
+
+    // Lataa hls.js vain tarvittaessa
+    async function ensureHls(){
+      if (window.Hls) return;
+      await new Promise((res, rej)=>{ const s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/hls.js@1'; s.onload=res; s.onerror=rej; document.head.appendChild(s); });
+    }
+    await ensureHls();
+
+    if (window.Hls && Hls.isSupported()){
+      hls = new Hls({ enableWorker:true, lowLatencyMode:true });
+      hls.loadSource(url);
+      hls.attachMedia($v);
+      hls.on(Hls.Events.MANIFEST_PARSED, ()=>{ $v.play().catch(()=>{}); setStatus(''); });
+      hls.on(Hls.Events.ERROR, (_e, data)=>{
+        if (data?.fatal){
+          setStatus('Toisto epäonnistui (' + (data?.details||'') + '). Todennäköinen syy: CORS/geo/HTTP‑segmentit.');
+          destroyHls();
+        }
+      });
+      return;
+    }
+    setStatus('Selain ei tue HLS‑toistoa.');
+  }
+
+  function updateCountries(src){
+    const uniq = Array.from(new Set(src.map(i=>i.country).filter(Boolean))).sort((a,b)=>regionName(a).localeCompare(regionName(b),'fi'));
+    $country.innerHTML = '<option value="">Kaikki maat</option>' + uniq.map(c=>`<option value="${c}">${regionName(c)} (${c})</option>`).join('');
+  }
+  function render(){
+    $list.innerHTML = '';
+    if (!current.length){ $list.innerHTML = '<div class="row" style="cursor:default"><span class="name">Ei osumia.</span></div>'; return; }
+    const arr=[...current].sort((a,b)=>(a.country||'').localeCompare(b.country||'') || a.name.localeCompare(b.name));
+    for (const it of arr){
+      const btn=document.createElement('button'); btn.type='button'; btn.className='row';
+      btn.innerHTML = `
+        ${it.logo ? `<img class="logo" src="${it.logo}" alt="">` : `<span class="logo" aria-hidden="true"></span>`}
+        <span class="name">${it.name}</span>
+        <span class="meta">${regionName(it.country)||''}</span>`;
+      btn.addEventListener('click', ()=>play(it.url, it.name));
+      $list.appendChild(btn);
+    }
+  }
+  function applyFilters(){
+    const gid=$genre.value, cc=$country.value, term=($q.value||'').trim().toLowerCase();
+    current = allItems.filter(it=>{
+      if (gid && !(it.categories||[]).includes(gid)) return false;
+      if (cc && it.country!==cc) return false;
+      if (term && !it.name.toLowerCase().includes(term)) return false;
+      return true;
+    });
+    render();
+  }
+
+  async function loadAll(){
+    setStatus('Ladataan…');
+    try{
+      const [channels, streams, categories] = await Promise.all([
+        fetch(API+'/channels.json').then(r=>r.json()),
+        fetch(API+'/streams.json').then(r=>r.json()),
+        fetch(API+'/categories.json').then(r=>r.json())
+      ]);
+
+      const playable = firstPlayableByChannel(streams);
+      allItems = [];
+      for (const ch of channels){
+        const url = playable.get(ch.id); if (!url) continue;
+        allItems.push({ id:ch.id, name:ch.name, country:ch.country||'', logo:ch.logo||'', url, categories:Array.isArray(ch.categories)?ch.categories:[] });
+      }
+
+      // Genrelista suomeksi (vain käytetyt kategoriat)
+      const used = new Set(allItems.flatMap(x=>x.categories||[]));
+      const cats = categories.filter(c=>used.has(c.id)).map(c=>({ id:c.id, name:FI_CAT[c.id]||c.name||c.id }));
+      cats.sort((a,b)=>a.name.localeCompare(b.name,'fi'));
+      $genre.innerHTML = '<option value="">Kaikki genret</option>' + cats.map(c=>`<option value="${c.id}">${c.name}</option>`).join('');
+
+      updateCountries(allItems);
+      current = allItems; render(); setStatus('');
+      const first = $list.querySelector('.row'); if (first) first.click();
+    }catch(e){ console.error(e); setStatus('Lataus epäonnistui.'); }
+  }
+
+  $genre.addEventListener('change', applyFilters);
+  $country.addEventListener('change', applyFilters);
+  $q.addEventListener('input', applyFilters);
+
+  loadAll();
+})();
+</script>
