@@ -9,3 +9,5 @@ TV4.html = Remove full screen button - Add F hotkey
 TV5.html = Direct sharing to channel page
 
 TV6.html = Added favorites menu
+
+TV7.html = Show total number of channels per category or location
