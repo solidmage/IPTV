@@ -1,0 +1,475 @@
+<div id="iptv-embed"></div>
+
+<script>
+(function(){
+  function boot(){
+    var HOST_ID='iptv-embed';
+    var API='https://iptv-org.github.io/api';
+
+    /* Skannauksen asetukset */
+    var VERIFY_CONCURRENCY = 8;      /* montako kanavaa testataan kerralla */
+    var VERIFY_TIMEOUT_MS  = 5000;   /* proben aikakatkaisu (ms) */
+    var REQUIRE_FILTER     = true;   /* probaus alkaa vasta kun genre tai maa valittu */
+    var PROBE_SEGMENT      = true;   /* testaa myös ensimmäinen segmentti */
+
+    var host=document.getElementById(HOST_ID); if(!host){return;}
+    var root; try{ root=host.attachShadow({mode:'open'}); }catch(e){ root=host; }
+
+    root.innerHTML = [
+      '<style>',
+      /* Tumma/harmaa teema */
+      '.card{border:1px solid #2a2f3a;border-radius:12px;padding:12px;background:#1b1f2a;box-shadow:0 6px 18px rgba(0,0,0,.35);color:#e6e9ef}',
+      '.controls{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}',
+      '@media (max-width:780px){.controls{grid-template-columns:1fr}}',
+      'label{display:flex;align-items:center;gap:6px;color:#e6e9ef}',
+      'select,input[type="search"]{width:100%;padding:8px 10px;border:1px solid #2a2f3a;border-radius:8px;background:#0f1218;color:#e6e9ef}',
+      '.grid{display:grid;grid-template-columns:320px 1fr;gap:12px}',
+      '@media (max-width:980px){.grid{grid-template-columns:1fr}}',
+      '.list{max-height:60vh;overflow:auto;border:1px solid #2a2f3a;border-radius:8px;background:#12161e}',
+      '.row{width:100%;display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid #242a36;background:#171a20;cursor:pointer;text-align:left}',
+      '.row:hover{background:#1f2532}',
+      /* Logo vain jos on – ei paikkamerkkiä */
+      '.logo{width:28px;height:28px;object-fit:contain;background:#fff;border:1px solid #333;border-radius:4px}',
+      /* Isompi lippu kanavalistassa */
+      '.flag{min-width:28px;display:inline-flex;align-items:center;justify-content:center;font-size:22px;line-height:1}',
+      '.name{font-weight:600;font-size:14px;color:#e6e9ef}',
+      '.meta{margin-left:auto;opacity:.78;font-size:12px;color:#c7cede}',
+      'video{width:100%;height:auto;background:#000;border-radius:8px}',
+      '.status,.note,.now{font-size:12px;margin-top:6px;color:#cdd3dc}',
+      '.status{opacity:.95}.note{opacity:.9}.now{opacity:1}',
+      '</style>',
+
+      '<div class="card">',
+        '<div class="controls">',
+          '<label>Genre <select id="genre"><option value="">Valitse genre</option></select></label>',
+          '<label>Maa <select id="country"><option value="">Valitse maa</option></select></label>',
+        '</div>',
+        '<input id="q" type="search" placeholder="Hae kanavaa… (valinnainen)">',
+        '<div class="grid">',
+          '<div id="list" class="list" aria-live="polite"></div>',
+          '<div class="player">',
+            '<video id="v" controls autoplay playsinline muted></video>',
+            '<div id="status" class="status"></div>',
+            '<div class="note">Vihje: selaimet sallivat automaattisen toiston usein vain mykistettynä. Paina F nappia avataksesi video kokoruudulle</div>',
+            '<div id="now" class="now">Katsot nyt: —</div>',
+          '</div>',
+        '</div>',
+      '</div>'
+    ].join('');
+
+    function $(s){ return root.querySelector(s); }
+    var $v=$('#v'), $status=$('#status'), $list=$('#list'),
+        $genre=$('#genre'), $country=$('#country'), $q=$('#q'), $now=$('#now');
+
+    var FI_CAT={
+      news:'Uutiset',entertainment:'Viihde',movies:'Elokuvat',series:'Sarjat',
+      sports:'Urheilu',music:'Musiikki',documentary:'Dokumentit',general:'Yleiset',
+      kids:'Lapset',family:'Perhe',comedy:'Komedia',education:'Koulutus',culture:'Kulttuuri',
+      lifestyle:'Lifestyle',shop:'Ostoskanavat',travel:'Matkailu',weather:'Sää',
+      business:'Talous',legislative:'Parlamentti',local:'Paikalliset',classic:'Klassikot',
+      animation:'Animaatio',cooking:'Ruoka',outdoor:'Ulkoilu',auto:'Autoilu',
+      science:'Tiede',technology:'Teknologia'
+    };
+
+    var hls=null, allItems=[], probeCache=new Map();
+    var isScanning=false;
+
+    function setStatus(t){ $status.textContent = t ? String(t) : ''; }
+    function setNow(label){ $now.textContent = label ? ('Katsot nyt: '+label) : 'Katsot nyt: —'; }
+    function destroyHls(){ if(hls){ try{hls.destroy();}catch(e){} hls=null; } try{$v.removeAttribute('src');$v.load();}catch(e){} }
+
+    function regionName(code){
+      try{ var dn=new Intl.DisplayNames(['fi'],{type:'region'}); var n=dn.of(code); if(!n){ n=code; } return n; }
+      catch(e){ return code; }
+    }
+    function flagEmoji(cc){
+      if(!cc){ return ''; }
+      if(cc.length!==2){ return ''; }
+      var code=cc.toUpperCase(); if(code==='XK'){ return '🇽🇰'; }
+      var A=127462, first=A+(code.charCodeAt(0)-65), second=A+(code.charCodeAt(1)-65);
+      if(first<A){ return ''; }
+      if(second<A){ return ''; }
+      try{ return String.fromCodePoint(first)+String.fromCodePoint(second); }catch(e){ return ''; }
+    }
+
+    /* Koko ruutu: F-näppäin + tuplaklikkaus videossa */
+    function isFs(){
+      if(document.fullscreenElement){ return true; }
+      if(document.webkitFullscreenElement){ return true; }
+      if(document.msFullscreenElement){ return true; }
+      return false;
+    }
+    function exitFs(){
+      if(document.exitFullscreen){ document.exitFullscreen(); return; }
+      if(document.webkitExitFullscreen){ document.webkitExitFullscreen(); return; }
+      if(document.msExitFullscreen){ document.msExitFullscreen(); return; }
+    }
+    function reqFs(el){
+      if(el.requestFullscreen){ el.requestFullscreen(); return; }
+      if(el.webkitRequestFullscreen){ el.webkitRequestFullscreen(); return; }
+      if(el.webkitEnterFullscreen){ try{ el.webkitEnterFullscreen(); }catch(e){} return; }
+      if(el.msRequestFullscreen){ el.msRequestFullscreen(); return; }
+    }
+    function toggleFs(){ if(isFs()){ exitFs(); } else { reqFs($v); } }
+    document.addEventListener('keydown', function(ev){
+      var k = ev.key ? ev.key : '';
+      var c = ev.code ? ev.code : '';
+      var pressed=false;
+      if(k==='f'){ pressed=true; }
+      if(!pressed){ if(k==='F'){ pressed=true; } }
+      if(!pressed){ if(c==='KeyF'){ pressed=true; } }
+      if(pressed){ toggleFs(); }
+    });
+    $v.addEventListener('dblclick', function(){ toggleFs(); });
+
+    /* Stream-metadatafiltteri */
+    function isPlayableStreamMeta(s){
+      if(!s){return false;}
+      if(!s.url){return false;}
+      if(!s.channel){return false;}
+      var u=String(s.url).trim().toLowerCase();
+      if(u.indexOf('https://')!==0){return false;}
+      if(u.indexOf('.m3u8')===-1){return false;}
+      if(s.referrer){return false;}
+      if(s.user_agent){return false;}
+      return true;
+    }
+    function firstPlayableByChannel(streams){
+      var map=new Map(); var i;
+      for(i=0;i<streams.length;i++){
+        var s=streams[i];
+        if(isPlayableStreamMeta(s)){
+          if(!map.has(s.channel)){ map.set(s.channel, s.url); }
+        }
+      }
+      return map;
+    }
+
+    /* Probaus: manifesti (+ tarvittaessa 1. segmentti) */
+    function withTimeout(p, ms){
+      return Promise.race([
+        p,
+        new Promise(function(_r,rej){ setTimeout(function(){ rej(new Error('timeout')); }, ms); })
+      ]);
+    }
+    async function fetchText(url){
+      var r = await fetch(url, { mode:'cors' });
+      if(!r.ok){ throw new Error('HTTP '+r.status); }
+      return r.text();
+    }
+    function firstNonCommentLine(text){
+      var lines=text.split('\n'); var i;
+      for(i=0;i<lines.length;i++){
+        var l=lines[i].trim();
+        if(!l){ continue; }
+        if(l.charAt(0)!=='#'){ return l; }
+      }
+      return '';
+    }
+    async function probeStream(url){
+      if(String(location.protocol)==='https:'){
+        if(String(url).indexOf('http://')===0){ return { ok:false, reason:'Sekasisältö (http)' }; }
+      }
+      var text;
+      try{ text = await fetchText(url); }
+      catch(e){ return { ok:false, reason:'CORS/403 manifestissa' }; }
+      if(text.indexOf('#EXTM3U')!==0){ return { ok:false, reason:'Ei HLS‑manifesti' }; }
+      if(String(location.protocol)==='https:'){
+        var mixed=/^(?!#).*http:\/\//mi.test(text);
+        if(mixed){ return { ok:false, reason:'Manifestissa http‑segmenttejä' }; }
+      }
+      if(!PROBE_SEGMENT){ return { ok:true }; }
+      var mediaText=text, base=url;
+      var isMaster = /#EXT-X-STREAM-INF/i.test(text);
+      if(isMaster){
+        var variant = firstNonCommentLine(text);
+        if(!variant){ return { ok:false, reason:'Master ilman varianttia' }; }
+        var vurl = new URL(variant, url).toString();
+        try{ mediaText = await fetchText(vurl); base=vurl; }
+        catch(e){ return { ok:false, reason:'CORS/403 variantissa' }; }
+        if(mediaText.indexOf('#EXTM3U')!==0){ return { ok:false, reason:'Variantti ei HLS' }; }
+        if(String(location.protocol)==='https:'){
+          var mixed2=/^(?!#).*http:\/\//mi.test(mediaText);
+          if(mixed2){ return { ok:false, reason:'Variantissa http‑segmenttejä' }; }
+        }
+      }
+      var seg = firstNonCommentLine(mediaText);
+      if(!seg){ return { ok:false, reason:'Ei segmenttejä' }; }
+      var segUrl = new URL(seg, base).toString();
+      try{
+        var r = await fetch(segUrl, { mode:'cors' });
+        if(!r.ok){ return { ok:false, reason:'HTTP '+r.status+' segmentissä' }; }
+      }catch(e){ return { ok:false, reason:'CORS/403 segmentissä' }; }
+      return { ok:true };
+    }
+    async function cachedProbe(url){
+      var res = probeCache.get(url);
+      if(res){ return res; }
+      try{ res = await withTimeout(probeStream(url), VERIFY_TIMEOUT_MS); }
+      catch(e){ res = { ok:false, reason:'Aikakatkaisu' }; }
+      probeCache.set(url, res);
+      return res;
+    }
+
+    /* Rivin lisääminen listaan sitä mukaa kun kanava läpäisee testin */
+    function appendRow(it){
+      var btn=document.createElement('button'); btn.type='button'; btn.className='row';
+      if(it.logo){
+        var img=document.createElement('img'); img.className='logo'; img.src=it.logo; img.alt=''; btn.appendChild(img);
+      }
+      var rn=it.country?regionName(it.country):''; var fl=it.country?flagEmoji(it.country):'';
+      var f=document.createElement('span'); f.className='flag'; f.title=rn; f.textContent=fl; btn.appendChild(f);
+      var n=document.createElement('span'); n.className='name'; n.textContent=it.name; btn.appendChild(n);
+      var m=document.createElement('span'); m.className='meta'; m.textContent=rn; btn.appendChild(m);
+      btn.addEventListener('click', function(){ startPlay(it); });
+      $list.appendChild(btn);
+    }
+
+    /* Progressiivinen verifiointi + näkyvä skannausstatus koko prosessin ajan */
+    async function verifyAndFill(candidates){
+      isScanning=true;
+      $list.innerHTML='';
+      if(candidates.length===0){
+        var empty=document.createElement('div'); empty.className='row'; empty.style.cursor='default';
+        var t=document.createElement('span'); t.className='name'; t.textContent='Ei osumia valituilla suodattimilla.'; empty.appendChild(t);
+        $list.appendChild(empty); setStatus(''); isScanning=false; return;
+      }
+
+      var total=candidates.length;
+      setStatus('Skannataan… 0 / '+total+' — odota hetki');
+
+      var arr=candidates.slice();
+      arr.sort(function(a,b){
+        var ca=a.country?a.country:''; var cb=b.country?b.country:'';
+        var r=ca.localeCompare(cb); if(r!==0){ return r; }
+        return a.name.localeCompare(b.name);
+      });
+
+      var idx=0, tested=0, passed=0;
+
+      async function worker(){
+        for(;;){
+          var i=idx; idx=idx+1;
+          if(i>=arr.length){ break; }
+          var it=arr[i];
+          var res=await cachedProbe(it.url);
+          tested=tested+1;
+          if(res){ if(res.ok){ passed=passed+1; appendRow(it); } }
+          setStatus('Skannataan… '+tested+' / '+total+' — OK: '+passed);
+        }
+      }
+
+      var jobs=[], k; for(k=0;k<VERIFY_CONCURRENCY;k++){ jobs.push(worker()); }
+      await Promise.all(jobs);
+
+      isScanning=false;
+      setStatus('Valmis: '+passed+' / '+total+' toimivaa kanavaa.');
+    }
+
+    /* Maa-filtterin optiot lipuilla */
+    function updateCountries(src){
+      var seen={}, codes=[], i, cc;
+      for(i=0;i<src.length;i++){
+        cc=src[i].country;
+        if(cc){
+          if(!seen[cc]){ seen[cc]=true; codes.push(cc); }
+        }
+      }
+      codes.sort(function(a,b){ return regionName(a).localeCompare(regionName(b),'fi'); });
+
+      var frag=document.createDocumentFragment();
+      var def=document.createElement('option'); def.value=''; def.textContent='Valitse maa'; frag.appendChild(def);
+      for(i=0;i<codes.length;i++){
+        cc=codes[i];
+        var opt=document.createElement('option'); opt.value=cc;
+        var lbl=flagEmoji(cc)+' '+regionName(cc)+' ('+cc+')';
+        opt.textContent=lbl.trim();
+        frag.appendChild(opt);
+      }
+      $country.innerHTML=''; $country.appendChild(frag);
+    }
+
+    /* Perussuodatus; probaus käynnistyy vasta valinnan jälkeen */
+    function filterItems(){
+      var gid=$genre.value, cc=$country.value, term=($q.value||'').trim().toLowerCase();
+      var arr=[]; var i;
+      for(i=0;i<allItems.length;i++){
+        var it=allItems[i]; var pass=true;
+
+        if(gid){
+          var cats = Array.isArray(it.categories) ? it.categories : [];
+          var ok=false; var j;
+          for(j=0;j<cats.length;j++){ if(cats[j]===gid){ ok=true; break; } }
+          if(!ok){ pass=false; }
+        }
+        if(pass){
+          if(cc){ if(it.country!==cc){ pass=false; } }
+        }
+        if(pass){
+          if(term){
+            var nm=it.name?it.name.toLowerCase():'';
+            if(nm.indexOf(term)===-1){ pass=false; }
+          }
+        }
+        if(pass){ arr.push(it); }
+      }
+      return arr;
+    }
+
+    function maybeStartVerification(){
+      var hasSel=false;
+      if($genre.value){ hasSel=true; }
+      if(!hasSel){ if($country.value){ hasSel=true; } }
+      if(REQUIRE_FILTER){
+        if(!hasSel){
+          $list.innerHTML='';
+          var info=document.createElement('div'); info.className='row'; info.style.cursor='default';
+          var t=document.createElement('span'); t.className='name'; t.textContent='Valitse genre ja/tai maa aloittaaksesi testauksen.'; info.appendChild(t);
+          $list.appendChild(info);
+          setStatus('');
+          return;
+        }
+      }
+      verifyAndFill(filterItems());
+    }
+
+    /* Toisto + “Katsot nyt” */
+    async function startPlay(item){
+      var rn=item.country?regionName(item.country):''; var fl=item.country?flagEmoji(item.country):'';
+      var now=''; if(fl){ now=fl+' '; } now=now+item.name; if(rn){ now=now+' • '+rn; }
+      setNow(now);
+      setStatus('Yhdistetään: '+item.name);
+      destroyHls();
+
+      /* kevyt tarkistus myös toistettaessa */
+      try{
+        var r=await fetch(item.url,{mode:'cors'});
+        if(!r.ok){ setStatus('Toisto estyi: HTTP '+r.status); return; }
+        var t=await r.text();
+        if(t.indexOf('#EXTM3U')!==0){ setStatus('Toisto estyi: Ei HLS‑manifesti'); return; }
+        var bad=/^(?!#).*http:\/\//mi.test(t);
+        if(String(location.protocol)==='https:' && bad){ setStatus('Toisto estyi: Manifestissa http‑segmenttejä'); return; }
+      }catch(e){
+        setStatus('Toisto estyi: CORS/anti‑hotlink');
+        return;
+      }
+
+      if($v.canPlayType){
+        if($v.canPlayType('application/vnd.apple.mpegurl')){
+          $v.src=item.url; try{$v.play();}catch(e){} setStatus(''); return;
+        }
+      }
+      if(!window.Hls){
+        await new Promise(function(res,rej){
+          var s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/hls.js@1';
+          s.onload=res; s.onerror=rej; document.head.appendChild(s);
+        }).catch(function(){});
+      }
+      if(window.Hls){
+        if(window.Hls.isSupported()){
+          hls=new window.Hls({enableWorker:true,lowLatencyMode:true});
+          hls.loadSource(item.url); hls.attachMedia($v);
+          hls.on(window.Hls.Events.MANIFEST_PARSED,function(){ try{$v.play();}catch(e){} setStatus(''); });
+          hls.on(window.Hls.Events.ERROR,function(_e,data){
+            var fatal=false; if(data){ if(data.fatal){ fatal=true; } }
+            var det='virhe'; if(data){ if(data.details){ det=data.details; } }
+            if(fatal){ setStatus('Toisto epäonnistui ('+det+')'); destroyHls(); }
+          });
+          return;
+        }
+      }
+      setStatus('Selain ei tue HLS‑toistoa.');
+    }
+
+    /* Datan lataus (vain listat; ei probea vielä) */
+    var allItems=[];
+    async function loadAll(){
+      $list.innerHTML='';
+      var info=document.createElement('div'); info.className='row'; info.style.cursor='default';
+      var t=document.createElement('span'); t.className='name'; t.textContent='Ladataan kanavalistoja…'; info.appendChild(t);
+      $list.appendChild(info);
+
+      try{
+        var results=await Promise.all([
+          fetch(API+'/channels.json',{mode:'cors'}).then(function(r){return r.json();}),
+          fetch(API+'/streams.json',{mode:'cors'}).then(function(r){return r.json();}),
+          fetch(API+'/categories.json',{mode:'cors'}).then(function(r){return r.json();})
+        ]);
+        var channels=results[0], streams=results[1], categories=results[2];
+
+        var playMap=firstPlayableByChannel(streams);
+        allItems=[];
+        var i;
+        for(i=0;i<channels.length;i++){
+          var ch=channels[i]; var url=playMap.get(ch.id);
+          if(!url){ continue; }
+          var cats = Array.isArray(ch.categories) ? ch.categories : [];
+          allItems.push({
+            id:ch.id, name:ch.name, country:(ch.country?ch.country:''), logo:(ch.logo?ch.logo:''), url:url, categories:cats
+          });
+        }
+
+        /* Genret (vain käytetyt; suomeksi) */
+        var used={}, a,b;
+        for(a=0;a<allItems.length;a++){
+          var cs = Array.isArray(allItems[a].categories) ? allItems[a].categories : [];
+          for(b=0;b<cs.length;b++){ used[cs[b]]=true; }
+        }
+        var cats=[], c;
+        for(a=0;a<categories.length;a++){
+          c=categories[a];
+          if(used[c.id]){
+            var nm=FI_CAT[c.id]; if(!nm){ nm=c.name?c.name:c.id; }
+            cats.push({id:c.id,name:nm});
+          }
+        }
+        cats.sort(function(x,y){ return x.name.localeCompare(y.name,'fi'); });
+        var ghtml='<option value="">Valitse genre</option>'; var z;
+        for(z=0;z<cats.length;z++){ ghtml=ghtml+'<option value="'+cats[z].id+'">'+cats[z].name+'</option>'; }
+        $genre.innerHTML=ghtml;
+
+        updateCountries(allItems);
+
+        $list.innerHTML='';
+        var tip=document.createElement('div'); tip.className='row'; tip.style.cursor='default';
+        var sp=document.createElement('span'); sp.className='name'; sp.textContent='Valitse genre ja/tai maa aloittaaksesi testauksen.'; tip.appendChild(sp);
+        $list.appendChild(tip);
+        setStatus('');
+      }catch(e){
+        console.error(e);
+        $list.innerHTML='';
+        var err=document.createElement('div'); err.className='row'; err.style.cursor='default';
+        var sp2=document.createElement('span'); sp2.className='name'; sp2.textContent='Datan lataus epäonnistui.'; err.appendChild(sp2);
+        $list.appendChild(err);
+        setStatus('Datan lataus epäonnistui (CORS/verkko/evästeet).');
+      }
+    }
+
+    /* Tapahtumat – probaus vasta valinnan jälkeen */
+    $genre.addEventListener('change', function(){ if(!isScanning){ maybeStartVerification(); } });
+    $country.addEventListener('change', function(){ if(!isScanning){ maybeStartVerification(); } });
+    $q.addEventListener('input', function(){
+      if(REQUIRE_FILTER){
+        var hasSel=false; if($genre.value){ hasSel=true; } if(!hasSel){ if($country.value){ hasSel=true; } }
+        if(!hasSel){
+          $list.innerHTML='';
+          var info=document.createElement('div'); info.className='row'; info.style.cursor='default';
+          var t=document.createElement('span'); t.className='name'; t.textContent='Valitse genre ja/tai maa aloittaaksesi testauksen.'; info.appendChild(t);
+          $list.appendChild(info);
+          if(!isScanning){ setStatus(''); }
+          return;
+        }
+      }
+      if(!isScanning){ maybeStartVerification(); }
+    });
+
+    loadAll();
+  }
+
+  if(document.readyState==='loading'){
+    document.addEventListener('DOMContentLoaded',boot,{once:true});
+  }else{
+    boot();
+  }
+})();
+</script>
